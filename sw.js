@@ -1,12 +1,10 @@
-const CACHE_NAME = 'vault-cache-v7';
-
+const CACHE_NAME = 'note-v2';
 const urlsToCache = [
   './',
   './index.html',
   './style.css',
   './script.js',
-  './icon.png',
-  './manifest.json'
+  './icon.png'
 ];
 
 self.addEventListener('install', event => {
@@ -17,8 +15,6 @@ self.addEventListener('install', event => {
 
 self.addEventListener('fetch', event => {
   event.respondWith(
-    caches.match(event.request).then(response => {
-      return response || fetch(event.request);
-    })
+    caches.match(event.request).then(response => response || fetch(event.request))
   );
 });
