@@ -13,711 +13,868 @@ const auth = firebase.auth();
 const db = firebase.firestore();
 const provider = new firebase.auth.GoogleAuthProvider();
 
-const APP_PASS_KEY = 'smartNotes_appPass';
-const LOCAL_DATA_KEY = 'smartNotes_localData'; 
+let accounts = [];
+let folders = ["عام", "فيسبوك", "جوجل"];
+let unsubscribeVault = null;
 
-let allData = [];
-let currentFolderId = null;
-let searchMatches = [], currentSearchIndex = -1;
-let historyStack = [], historyIndex = -1, originalContent = '';
-let itemsClipboard = [], isPasteMode = false, clipboardAction = 'move';
-let activeCardId = null, currentNoteId = null, activeSubNoteIndex = null;
-let isMainSelectionMode = false, selectedMainIds = new Set();
-let isSelectionMode = false, selectedSubIndices = new Set();
-let activeEditResolve = null;
-
-let saveTimeout = null; 
-let unsubscribeNotes = null;
-let currentUid = null;
-
-async function hashPassword(password) {
-  const msgBuffer = new TextEncoder().encode(password);
-  const hashBuffer = await crypto.subtle.digest('SHA-256', msgBuffer);
-  const hashArray = Array.from(new Uint8Array(hashBuffer));
-  return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
-}
-
-document.addEventListener('DOMContentLoaded', () => {
-  document.getElementById('searchInput').value = '';
-  loadData(); 
-  document.getElementById('searchInput').addEventListener('focus', pushState);
-  document.getElementById('editTextArea').addEventListener('input', function() { saveHistory(this.value); });
-  document.getElementById('editSaveBtn').onclick = () => { window.history.back(); };
-  document.addEventListener('click', e => {
-    const cm = document.getElementById('createMenu');
-    if(cm.classList.contains('open') && !e.target.closest('#createMenu') && !e.target.closest('.fab'))
-      { cm.classList.remove('open'); cm.style.display = 'none'; }
-  });
-
-  const savedTheme = localStorage.getItem('smartNotes_theme');
-  if(savedTheme === 'dark') {
-      document.body.classList.add('dark-mode');
-      updateThemeIcon(true);
-  } else {
-      updateThemeIcon(false);
-  }
-});
+let longPressTimer, isLongPress = false;
+let currentCtxId = null, currentCtxType = null;
+let pendingCallback = null;
+let activeFolder = 'All'; 
+let isSelectionMode = false;
+let selectedIds = new Set();
+let isMoveAction = false; 
+let folderRenameTarget = null;
+let vaultPressTimer = null;
+let currentSort = 'newest';
 
 auth.onAuthStateChanged(user => {
+    const userNameEl = document.getElementById('userName');
+    const userEmailEl = document.getElementById('userEmail');
+    const userAvatarEl = document.getElementById('userAvatar');
+    const loginContainer = document.getElementById('googleLoginContainer');
+    const logoutContainer = document.getElementById('googleLogoutContainer');
+
     if (user) {
-        currentUid = user.uid;
-        checkGoogleLoginState();
+        loginContainer.style.display = 'none';
+        logoutContainer.style.display = 'block';
+        
+        if(userNameEl) userNameEl.innerText = user.displayName || "مستخدم";
+        if(userEmailEl) userEmailEl.innerText = user.email || "";
+        
+        const photoUrl = user.photoURL;
+        if(photoUrl && userAvatarEl) {
+            userAvatarEl.innerHTML = `<img src="${photoUrl}" alt="User">`;
+        }
         setupRealtimeListener(user.uid);
     } else {
-        currentUid = null;
-        if(unsubscribeNotes) { unsubscribeNotes(); unsubscribeNotes = null; }
-        checkGoogleLoginState();
+        loginContainer.style.display = 'block';
+        logoutContainer.style.display = 'none';
+        
+        if(userNameEl) userNameEl.innerText = "مستخدم زائر";
+        if(userEmailEl) userEmailEl.innerText = "سجل الدخول للمزامنة";
+        if(userAvatarEl) userAvatarEl.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>`;
+        
+        if(unsubscribeVault) {
+            unsubscribeVault();
+            unsubscribeVault = null;
+        }
+        accounts = [];
+        folders = ["عام"];
+        setSyncLoader(false, true);
     }
 });
 
-function loadData() {
-    const cachedData = localStorage.getItem(LOCAL_DATA_KEY);
-    if (cachedData) {
-        try { allData = JSON.parse(cachedData); renderMainGrid(); }
-        catch (e) { console.error(e); }
+// دوال القائمة الجانبية (السحب)
+function safeToggleMenu(e) {
+    if(e) e.stopPropagation();
+    const menu = document.getElementById('sideMenu');
+    const overlay = document.getElementById('sideMenuOverlay');
+    
+    if (menu.classList.contains('open')) {
+        menu.classList.remove('open');
+        overlay.classList.remove('active');
+    } else {
+        const appPass = localStorage.getItem('appPass');
+        if (appPass) {
+            openPasswordModal("رمز القائمة", (v) => {
+                if (v === appPass) {
+                    menu.classList.add('open');
+                    overlay.classList.add('active');
+                    updateLockText(true);
+                } else {
+                    showToast("خطأ بالرمز");
+                }
+            });
+        } else {
+            menu.classList.add('open');
+            overlay.classList.add('active');
+            updateLockText(false);
+        }
     }
 }
 
-function saveData() { 
-    localStorage.setItem(LOCAL_DATA_KEY, JSON.stringify(allData));
-    document.getElementById('syncText').innerText = "جاري الحفظ...";
-    setSyncLoader(true);
-    saveToFirebase();
+function closeSideMenu() {
+    const menu = document.getElementById('sideMenu');
+    const overlay = document.getElementById('sideMenuOverlay');
+    if(menu) menu.classList.remove('open');
+    if(overlay) overlay.classList.remove('active');
 }
 
-function saveToFirebase(silent = true) {
-    if(!currentUid) return;
-    const globalPass = localStorage.getItem(APP_PASS_KEY);
-    db.collection('smartNotes').doc(currentUid).set({
-        smartNotesData: allData,
-        appGlobalPass: globalPass
-    }).then(() => {
-        setSyncLoader(false);
-        document.getElementById('syncText').innerText = "";
-        if(!silent) showNotif("تم الحفظ في السحابة", "success");
-    }).catch(e => {
-        setSyncLoader(false);
-        document.getElementById('syncText').innerText = "";
-        if(!silent) showNotif("فشل الرفع", "error");
+function updateLockText(hasLock) {
+    const lockText = document.getElementById('lockMenuText');
+    if(lockText) {
+        lockText.innerText = (hasLock || localStorage.getItem('appPass')) ? "إلغاء قفل التطبيق" : "تعيين قفل للتطبيق";
+    }
+}
+
+function startGoogleLogin() {
+    closeSideMenu();
+    showToast("جاري الاتصال بجوجل...");
+    auth.signInWithPopup(provider).catch(error => {
+        console.error(error);
+        showToast("فشل الدخول");
     });
+}
+
+function handleGoogleLogout() {
+    closeSideMenu();
+    customConfirm("هل تريد تسجيل الخروج؟", () => {
+        auth.signOut().then(() => {
+            accounts = [];
+            folders = ["عام"];
+            renderVault();
+            showToast("تم تسجيل الخروج");
+        });
+    });
+}
+
+function setSyncLoader(isSyncing, isError = false) { 
+    const dot = document.getElementById('syncDot');
+    if (dot) {
+        if (isError) {
+            dot.className = 'sync-dot error';
+        } else {
+            dot.className = isSyncing ? 'sync-dot syncing' : 'sync-dot synced';
+        }
+    }
 }
 
 function setupRealtimeListener(uid) {
     setSyncLoader(true);
-    unsubscribeNotes = db.collection('smartNotes').doc(uid).onSnapshot(docSnap => {
-        if (docSnap.exists) {
+    unsubscribeVault = db.collection('vaults').doc(uid).onSnapshot(docSnap => {
+        if(docSnap.exists) {
             const data = docSnap.data();
-            if(data.smartNotesData) {
-                allData = data.smartNotesData;
-                localStorage.setItem(LOCAL_DATA_KEY, JSON.stringify(allData));
-            }
-            if(data.appGlobalPass) {
-                localStorage.setItem(APP_PASS_KEY, data.appGlobalPass);
-            } else {
-                localStorage.removeItem(APP_PASS_KEY);
-            }
-            renderMainGrid();
-            if(currentNoteId) renderSubNotes();
+            accounts = data.accounts || [];
+            folders = data.folders || ["عام", "فيسبوك", "جوجل"];
+        } else {
+            accounts = [];
+            folders = ["عام", "فيسبوك", "جوجل"];
+            saveToCloud(); 
         }
+        applySort(currentSort, false); 
+        renderFoldersBar();
         setSyncLoader(false);
     }, error => {
-        setSyncLoader(false);
-        showNotif("فشل المزامنة", "error");
+        console.error(error);
+        setSyncLoader(false, true);
+        showToast("فشل جلب البيانات");
     });
 }
 
-window.addEventListener('popstate', () => {
-  const openSheet = ['ctxSheet', 'subCtxSheet', 'dragSheet', 'settingsSheet'].find(id => { const el = document.getElementById(id); return el && el.classList.contains('open'); });
-  if(openSheet) { closeSheet(openSheet); return; }
-  
-  const editModal = document.getElementById('editModal');
-  if(editModal.style.display === 'flex') { 
-      const v = document.getElementById('editTextArea').value;
-      if(v !== originalContent) {
-          if(activeEditResolve) { activeEditResolve(v); activeEditResolve = null; }
-          showNotif('تم الحفظ', 'success');
-      } else {
-          if(activeEditResolve) { activeEditResolve(null); activeEditResolve = null; }
-      }
-      editModal.style.display = 'none'; 
-      document.getElementById('editSearchBar').style.display = 'none';
-      return; 
-  }
-
-  const inputModal = document.getElementById('inputModal');
-  if(inputModal.style.display === 'flex') { 
-      inputModal.style.display = 'none'; 
-      if(window._inputResolve) { window._inputResolve(null); window._inputResolve = null; }
-      return; 
-  }
-
-  const detailsModal = document.getElementById('detailsModal');
-  if(detailsModal.style.display === 'flex') { 
-      detailsModal.style.display = 'none';
-      document.getElementById('subSearchInput').value = ''; 
-      toggleSelectionMode(false);
-      return; 
-  }
-
-  if(document.getElementById('searchInput').value) { clearSearch(); return; }
-  if(currentFolderId !== null) { const pid = getParentFolderId(allData, currentFolderId); currentFolderId = (pid === undefined) ? null : pid; renderMainGrid(); return; }
-});
-function pushState() { window.history.pushState({open: true}, ''); }
-
-function findNoteById(list, id) { id = parseFloat(id); for(let it of list){ if(parseFloat(it.id) === id) return it; if(it.type === 'folder' && it.items){ const f = findNoteById(it.items, id); if(f) return f; } } return null; }
-function getCurrentList() { if(currentFolderId === null) return allData; const f = findNoteById(allData, currentFolderId); return f ? (f.items || []) : []; }
-function getParentFolderId(list, targetId, parentId = null) { for(let it of list){ if(parseFloat(it.id) === parseFloat(targetId)) return parentId; if(it.type === 'folder' && it.items){ const f = getParentFolderId(it.items, targetId, it.id); if(f !== undefined) return f; } } return undefined; }
-function removeItemFromTree(list, id) { for(let i = 0; i < list.length; i++){ if(parseFloat(list[i].id) === parseFloat(id)){ list.splice(i, 1); return true; } if(list[i].type === 'folder' && list[i].items && removeItemFromTree(list[i].items, id)) return true; } return false; }
-
-function renderMainGrid(filter = '') {
-  const grid = document.getElementById('notesGrid'); grid.innerHTML = '';
-  const nav = document.getElementById('navBar');
-  if(currentFolderId === null) { nav.style.display = 'none'; }
-  else { nav.style.display = 'flex'; const f = findNoteById(allData, currentFolderId); document.getElementById('currentPathTitle').textContent = f ? `📁 ${f.title}` : ''; }
-  
-  const pb = document.getElementById('pasteFloatingBtn'), fab = document.getElementById('mainFab');
-  if(isPasteMode) { pb.style.display = 'flex'; fab.style.display = 'none'; pb.childNodes[2].textContent = clipboardAction === 'move' ? ' لصق هنا (نقل)' : ' لصق هنا (نسخ)'; }
-  else { pb.style.display = 'none'; fab.style.display = 'flex'; }
-  
-  const list = getCurrentList();
-  const filtered = list.filter(n => n.title.toLowerCase().includes(filter.toLowerCase()));
-  if(!filtered.length) { grid.innerHTML = `<div class="empty-state"><svg viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg><p class="empty-text">لا توجد عناصر هنا بعد</p></div>`; return; }
-  
-  filtered.forEach(item => {
-    const card = document.createElement('div');
-    card.className = `note-card ${item.type === 'folder' ? 'is-folder' : 'is-note'}`;
-    card.dataset.id = item.id; card.dataset.type = item.type; card.draggable = true;
-    if(selectedMainIds.has(item.id)) card.classList.add('selected');
-    
-    let iconHtml = '', iconClass = 'note-ico';
-    if(item.isLocked) { iconClass = 'locked-ico'; iconHtml = `<svg viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>`; }
-    else if(item.type === 'folder') { iconClass = 'folder-ico'; iconHtml = `<svg viewBox="0 0 24 24"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>`; }
-    else if(item.type === 'note') { iconClass = 'note-ico'; iconHtml = `<svg viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>`; }
-    else { iconClass = 'locked-ico'; iconHtml = `<svg viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>`; }
-    
-    let countLabel = `<div class="card-count">${item.items ? item.items.length : 0} ${item.type === 'folder' ? 'عنصر' : 'ملاحظة'}</div>`;
-    if(item.type === 'file') countLabel = `<div class="card-count">ملف قديم</div>`;
-    
-    const selCheckSvg = `<svg viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></svg>`;
-    
-    card.innerHTML = `
-      <div class="card-sel-icon">${selCheckSvg}</div>
-      <div class="card-icon-wrap ${iconClass}">${iconHtml}</div>
-      <div class="card-title">${item.title}</div>
-      ${countLabel}
-      ${!isMainSelectionMode ? `<div class="sort-handle"><svg viewBox="0 0 24 24"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg></div>` : ''}
-    `;
-    
-    let pressTimer = null, touchMoved = false, touchStartX = 0, touchStartY = 0, isLongPress = false;
-    card.addEventListener('touchstart', e => {
-      if(e.target.closest('.sort-handle')) return;
-      touchMoved = false; isLongPress = false;
-      touchStartX = e.touches[0].clientX; touchStartY = e.touches[0].clientY;
-      pressTimer = setTimeout(() => {
-        if(!touchMoved) {
-          isLongPress = true;
-          if(navigator.vibrate) navigator.vibrate(40);
-          if(isMainSelectionMode) { toggleMainSelection(item.id); } else { showCtxSheet(item.id); }
-        }
-      }, 500);
-    }, {passive: true});
-    card.addEventListener('touchmove', e => {
-      const dx = Math.abs(e.touches[0].clientX - touchStartX); const dy = Math.abs(e.touches[0].clientY - touchStartY);
-      if(dx > 8 || dy > 8) { touchMoved = true; clearTimeout(pressTimer); }
-    }, {passive: true});
-    card.addEventListener('touchend', e => {
-      clearTimeout(pressTimer);
-      if(isLongPress) { e.preventDefault(); return; }
-      if(!touchMoved) { if(isMainSelectionMode) { e.preventDefault(); toggleMainSelection(item.id); } else { handleCardClick(e, item); } }
-    }, {passive: false});
-    card.addEventListener('click', e => { if(!('ontouchstart' in window)) { handleCardClick(e, item); } });
-    card.oncontextmenu = e => { e.preventDefault(); if(!touchMoved && !isLongPress) { showCtxSheet(item.id); } };
-    
-    addDragEvents(card, item);
-    grid.appendChild(card);
-  });
-  
-  document.getElementById('clearSearchBtn').style.display = filter ? 'flex' : 'none';
-}
-
-function searchNotes() { renderMainGrid(document.getElementById('searchInput').value); }
-function clearSearch() { document.getElementById('searchInput').value = ''; renderMainGrid(); }
-
-function handleCardClick(e, item) {
-  if(isMainSelectionMode) { toggleMainSelection(item.id); return; }
-  if(e.target.closest('.sort-handle')) return;
-  if(item.type === 'folder') { if(item.isLocked) { checkPassword(item, () => { currentFolderId = item.id; pushState(); renderMainGrid(); }); } else { currentFolderId = item.id; pushState(); renderMainGrid(); } }
-  else if(item.type === 'file') { showNotif('الملفات القديمة غير مدعومة. للتحميل اضغط مطولاً.', 'info'); }
-  else { if(item.isLocked) { checkPassword(item, () => openNoteDetails(item.id)); } else openNoteDetails(item.id); }
-}
-
-function openNoteDetails(id) { currentNoteId = id; pushState(); const n = findNoteById(allData, id); if(!n) return; document.getElementById('modalTitle').textContent = n.title; document.getElementById('detailsModal').style.display = 'flex'; renderSubNotes(); }
-
-function renderSubNotes() {
-  const el = document.getElementById('subNotesList'); el.innerHTML = '';
-  const n = findNoteById(allData, currentNoteId); if(!n) return;
-  const filter = document.getElementById('subSearchInput').value.toLowerCase();
-  (n.items || []).forEach((content, i) => {
-    if(filter && !content.toLowerCase().includes(filter)) return;
-    const li = document.createElement('li'); li.className = 'sub-note-item';
-    if(isSelectionMode && selectedSubIndices.has(i)) li.classList.add('selected');
-    
-    let words = content.trim().split(/\s+/);
-    let previewText = words.slice(0, 5).join(' ');
-    if(words.length > 5) previewText += '...';
-    if(!previewText) previewText = 'ملاحظة جديدة';
-
-    li.innerHTML = `<div class="sub-note-content">${previewText}</div><div style="padding:2px; color:#cbd5e1; cursor:pointer;" onclick="event.stopPropagation(); showSubCtxSheet(${i})"><svg viewBox="0 0 24 24" style="width:20px;height:20px;stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round"><circle cx="12" cy="12" r="2"/><circle cx="12" cy="5" r="2"/><circle cx="12" cy="19" r="2"/></svg></div>`;
-    let pt = null, tm = false, tsx = 0, tsy = 0, isLP = false;
-    li.addEventListener('touchstart', e => { tm = false; isLP = false; tsx = e.touches[0].clientX; tsy = e.touches[0].clientY; pt = setTimeout(() => { if(!tm) { isLP = true; if(navigator.vibrate) navigator.vibrate(40); showSubCtxSheet(i); } }, 500); }, {passive: true});
-    li.addEventListener('touchmove', e => { if(Math.abs(e.touches[0].clientX - tsx) > 8 || Math.abs(e.touches[0].clientY - tsy) > 8) { tm = true; clearTimeout(pt); } }, {passive: true});
-    li.addEventListener('touchend', e => { clearTimeout(pt); if(isLP) { e.preventDefault(); return; } if(!tm) { if(isSelectionMode) toggleSubSelection(i); else editSubNote(i); } });
-    li.onclick = () => { if(!('ontouchstart' in window)) { if(isSelectionMode) toggleSubSelection(i); else editSubNote(i); } };
-    li.oncontextmenu = e => { e.preventDefault(); if(!tm && !isLP) showSubCtxSheet(i); };
-    el.appendChild(li);
-  });
-}
-
-function addSubNote() { const inp = document.getElementById('newSubNoteInput'); if(!inp.value.trim()) return; const n = findNoteById(allData, currentNoteId); if(!n.items) n.items = []; n.items.unshift(inp.value.trim()); inp.value = ''; saveData(); renderSubNotes(); }
-async function editSubNote(i) { const n = findNoteById(allData, currentNoteId); const v = await showEditModal(n.items[i]); if(v !== null) { n.items[i] = v; saveData(); renderSubNotes(); } }
-function toggleSelectionMode(a) { isSelectionMode = a; selectedSubIndices.clear(); document.getElementById('selectBtn').style.display = a ? 'none' : 'flex'; ['selectAllBtn', 'cancelSelectionBtn', 'deleteSubBtn'].forEach(id => document.getElementById(id).style.display = a ? 'flex' : 'none'); renderSubNotes(); }
-function toggleSubSelection(i) { selectedSubIndices.has(i) ? selectedSubIndices.delete(i) : selectedSubIndices.add(i); renderSubNotes(); }
-function selectAllSubNotes() { const n = findNoteById(allData, currentNoteId); if(n && n.items) n.items.forEach((_, i) => selectedSubIndices.add(i)); renderSubNotes(); }
-async function deleteSelectedSubNotesWrapper() { if(!selectedSubIndices.size) return; if(!await verifyAppPass()) return; if(await showConfirm('حذف العناصر المحددة؟')) { const n = findNoteById(allData, currentNoteId); Array.from(selectedSubIndices).sort((a,b) => b-a).forEach(i => n.items.splice(i, 1)); saveData(); toggleSelectionMode(false); } }
-
-function showEditModal(initialValue = '') {
-  pushState();
-  const ta = document.getElementById('editTextArea');
-  document.getElementById('editModal').style.display = 'flex';
-  ta.value = initialValue;
-  originalContent = initialValue;
-  initHistory(initialValue);
-  ta.blur();
-  return new Promise(resolve => { activeEditResolve = resolve; });
-}
-
-function handleEditBack() { window.history.back(); }
-
-function toggleEditSearch() { const bar = document.getElementById('editSearchBar'); const open = bar.style.display === 'flex'; bar.style.display = open ? 'none' : 'flex'; if(!open) { document.getElementById('inTextSearchInput').focus(); searchMatches = []; currentSearchIndex = -1; } }
-function initHistory(v) { historyStack = [v]; historyIndex = 0; updUR(); }
-function saveHistory(v) { if(historyIndex < historyStack.length - 1) historyStack = historyStack.slice(0, historyIndex + 1); historyStack.push(v); historyIndex++; updUR(); }
-function undo() { if(historyIndex > 0) { historyIndex--; document.getElementById('editTextArea').value = historyStack[historyIndex]; updUR(); } }
-function redo() { if(historyIndex < historyStack.length - 1) { historyIndex++; document.getElementById('editTextArea').value = historyStack[historyIndex]; updUR(); } }
-function updUR() { document.getElementById('btnUndo').style.opacity = historyIndex > 0 ? '1' : '.3'; document.getElementById('btnRedo').style.opacity = historyIndex < historyStack.length - 1 ? '1' : '.3'; }
-function findInText(dir) {
-  const ta = document.getElementById('editTextArea'); const term = document.getElementById('inTextSearchInput').value; if(!term) return;
-  if(!searchMatches.length || ta.value.indexOf(term, searchMatches[0]) !== searchMatches[0]) { searchMatches = []; let p = ta.value.indexOf(term); while(p > -1) { searchMatches.push(p); p = ta.value.indexOf(term, p + 1); } if(!searchMatches.length) { showNotif('لم يتم العثور', 'info'); return; } currentSearchIndex = -1; }
-  if(dir === 'next') { currentSearchIndex = (currentSearchIndex + 1) % searchMatches.length; } else { currentSearchIndex = (currentSearchIndex - 1 + searchMatches.length) % searchMatches.length; }
-  const mp = searchMatches[currentSearchIndex]; ta.focus(); ta.setSelectionRange(mp, mp + term.length); ta.scrollTop = (ta.value.substring(0, mp).split('\n').length - 2) * 24;
-}
-
-function showInputModal(msg, initVal = '', type = 'single', allowCopy = false, allowPaste = false) {
-  pushState();
-  document.getElementById('inputMessage').textContent = msg;
-  const si = document.getElementById('modalInputSingle'), ai = document.getElementById('modalInputArea');
-  si.style.display = type === 'single' ? 'block' : 'none'; ai.style.display = type === 'area' ? 'block' : 'none';
-  document.getElementById('inputCopyBtn').style.display = allowCopy ? 'flex' : 'none';
-  document.getElementById('inputPasteBtn').style.display = allowPaste ? 'flex' : 'none';
-  const active = type === 'single' ? si : ai; active.value = initVal;
-  document.getElementById('inputModal').style.display = 'flex';
-  setTimeout(() => active.focus(), 300);
-  return new Promise(resolve => {
-    document.getElementById('inputBtn').onclick = () => { 
-        if(window._inputResolve) { window._inputResolve(active.value); window._inputResolve = null; }
-        window.history.back();
-    };
-    window.copyModalContent = () => { navigator.clipboard.writeText(active.value); showNotif('تم النسخ', 'success'); };
-    window.pasteModalContent = async () => { try { active.value = await navigator.clipboard.readText(); } catch(e) { showNotif('تعذر الوصول للحافظة', 'error'); } };
-    window._inputResolve = resolve;
-  });
-}
-
-function closeInputModal() { window.history.back(); }
-
-function showConfirm(msg) { document.getElementById('confirmMessage').textContent = msg; document.getElementById('confirmModal').style.display = 'flex'; return new Promise(r => { window.hideConfirmModal = res => { document.getElementById('confirmModal').style.display = 'none'; r(res); }; }); }
-function showPasswordModal() { document.getElementById('modalPasswordInput').value = ''; document.getElementById('passwordModal').style.display = 'flex'; setTimeout(() => document.getElementById('modalPasswordInput').focus(), 200); return new Promise(r => { document.getElementById('passwordBtn').onclick = () => { const v = document.getElementById('modalPasswordInput').value; document.getElementById('passwordModal').style.display = 'none'; r(v); }; window.hidePasswordModal = v => { document.getElementById('passwordModal').style.display = 'none'; r(v); }; }); }
-
-async function checkPassword(item, cb) { 
-  const p = await showPasswordModal(); 
-  if(!p) return false; 
-  const hashed = await hashPassword(p);
-  if(hashed === item.passwordHash || btoa(p) === item.passwordHash) { 
-    if(cb) cb(); 
-    return true; 
-  } else { 
-    showNotif('كلمة المرور خاطئة', 'error'); 
-    return false; 
-  } 
-}
-
-async function verifyAppPass() { 
-  const sp = localStorage.getItem(APP_PASS_KEY); 
-  if(!sp) return true; 
-  const p = await showPasswordModal(); 
-  if(!p) return false;
-  const hashed = await hashPassword(p);
-  if(hashed === sp || btoa(p) === sp) return true; 
-  showNotif('كلمة مرور خاطئة', 'error'); 
-  return false; 
-}
-
-function openSheet(id) { document.getElementById('ctxOverlay').style.display = 'block'; requestAnimationFrame(() => document.getElementById(id).classList.add('open')); pushState(); }
-function closeSheet(id) { document.getElementById(id).classList.remove('open'); document.getElementById('ctxOverlay').style.display = 'none'; }
-function closeAllMenus() { ['ctxSheet', 'subCtxSheet', 'dragSheet', 'settingsSheet'].forEach(id => document.getElementById(id).classList.remove('open')); document.getElementById('ctxOverlay').style.display = 'none'; const cm = document.getElementById('createMenu'); cm.classList.remove('open'); cm.style.display = 'none'; }
-
-function showCtxSheet(id) {
-  const isMulti = isMainSelectionMode && selectedMainIds.size > 0;
-  let item = null;
-  
-  if(isMulti) {
-    const sel = getCurrentList().filter(n => selectedMainIds.has(n.id));
-    const allLocked = sel.every(n => n.isLocked);
-    document.getElementById('ctxLockLabel').textContent = allLocked ? 'فتح قفل المحدد' : 'قفل المحدد';
-    document.getElementById('ctxEditBtn').style.display = 'none';
-  } else {
-    activeCardId = id;
-    item = findNoteById(allData, id);
-    if(!item) return;
-    document.getElementById('ctxLockLabel').textContent = item.isLocked ? 'فتح القفل' : 'قفل';
-    document.getElementById('ctxEditBtn').style.display = 'flex';
-  }
-
-  document.getElementById('ctxLockBtn').style.display = 'flex';
-  document.getElementById('ctxHomeBtn').style.display = currentFolderId !== null ? 'flex' : 'none';
-  openSheet('ctxSheet');
-}
-function showSubCtxSheet(i) { activeSubNoteIndex = i; openSheet('subCtxSheet'); }
-
-async function handleMenuAction(action) {
-  closeSheet('ctxSheet'); 
-  const isMulti = isMainSelectionMode && selectedMainIds.size > 0;
-  let item = null;
-  
-  if(!isMulti) {
-    item = findNoteById(allData, activeCardId);
-    if(!item) return;
-  }
-  
-  if(action === 'delete') {
-    if(isMulti) { deleteSelectedMainNotesWrapper(); return; }
-    if(!await verifyAppPass()) return;
-    if(item.isLocked) { 
-      const p = await showPasswordModal(); 
-      if(!p) return;
-      const hashed = await hashPassword(p);
-      if(hashed !== item.passwordHash && btoa(p) !== item.passwordHash) { 
-        showNotif('كلمة المرور خاطئة', 'error'); return; 
-      } 
-    }
-    if(await showConfirm(`حذف "${item.title}"؟`)) { removeItemFromTree(allData, activeCardId); saveData(); renderMainGrid(); }
-  }
-  else if(action === 'edit') {
-    if(item.isLocked && !await checkPassword(item)) return;
-    const t = await showInputModal(item.type === 'folder' ? 'اسم المجلد:' : 'عنوان الملاحظة:', item.title, 'single');
-    if(t) { item.title = t; saveData(); renderMainGrid(); }
-  }
-  else if(action === 'toggleLock') {
-    const sp = localStorage.getItem(APP_PASS_KEY); 
-    
-    if(isMulti) {
-      const sel = getCurrentList().filter(n => selectedMainIds.has(n.id));
-      const allLocked = sel.every(n => n.isLocked);
-      if(allLocked) {
-        const p = await showPasswordModal();
-        if(p) {
-          const hashedP = await hashPassword(p);
-          const btoaP = btoa(p);
-          let c = 0;
-          sel.forEach(it => { 
-            if(it.passwordHash === hashedP || it.passwordHash === btoaP) { 
-              it.isLocked = false; it.passwordHash = null; c++; 
-            } 
-          });
-          showNotif(c > 0 ? `تم فتح ${c} عنصر` : 'كلمة المرور خاطئة', c > 0 ? 'success' : 'error');
-        }
-      } else {
-        const p = await showPasswordModal();
-        if(!p) return;
-        const hashedP = await hashPassword(p);
-        
-        if (sp && hashedP !== sp && btoa(p) !== sp) {
-          showNotif('كلمة المرور لا تطابق إعدادات التطبيق!', 'error');
-          return;
-        }
-
-        sel.forEach(it => { it.isLocked = true; it.passwordHash = hashedP; });
-        showNotif('تم القفل بنجاح', 'success');
-      }
-      toggleMainSelectionMode(false);
-    } else {
-      if(item.isLocked) { 
-        if(await checkPassword(item)) { item.isLocked = false; item.passwordHash = null; showNotif('تم فتح القفل', 'success'); } 
-      } else { 
-        const p = await showPasswordModal(); 
-        if(!p) return;
-        const hashedP = await hashPassword(p);
-        
-        if (sp && hashedP !== sp && btoa(p) !== sp) {
-          showNotif('كلمة المرور لا تطابق إعدادات التطبيق!', 'error');
-          return;
-        }
-
-        item.isLocked = true; item.passwordHash = hashedP; showNotif('تم القفل', 'success'); 
-      }
-    }
-    saveData(); renderMainGrid();
-  }
-  else if(action === 'move' || action === 'copy') {
-    if(!await verifyAppPass()) return;
-    const list = getCurrentList();
-    itemsClipboard = isMulti ? list.filter(n => selectedMainIds.has(n.id)) : [item];
-    clipboardAction = action; isPasteMode = true;
-    toggleMainSelectionMode(false); renderMainGrid();
-    showNotif(action === 'move' ? 'تم القص — انتقل للوجهة واضغط لصق' : 'تم النسخ — انتقل للوجهة واضغط لصق', 'info');
-  }
-  else if(action === 'moveToRoot') {
-    if(currentFolderId === null) return; if(!await verifyAppPass()) return;
-    const list = getCurrentList(); const items = isMulti ? list.filter(n => selectedMainIds.has(n.id)) : [item];
-    if(await showConfirm('إضافة العناصر للواجهة الرئيسية؟')) {
-      const folder = findNoteById(allData, currentFolderId);
-      items.forEach(it => { folder.items = folder.items.filter(n => n.id !== it.id); allData.unshift(it); });
-      saveData(); toggleMainSelectionMode(false); renderMainGrid(); showNotif('تمت الإضافة', 'success');
-    }
-  }
-}
-
-async function handleSubNoteAction(action) {
-  closeSheet('subCtxSheet');
-  const n = findNoteById(allData, currentNoteId);
-  if(action === 'delete') { if(!await verifyAppPass()) return; n.items.splice(activeSubNoteIndex, 1); saveData(); renderSubNotes(); }
-  else if(action === 'copy') { navigator.clipboard.writeText(n.items[activeSubNoteIndex]); showNotif('تم النسخ', 'success'); }
-  else if(action === 'edit') { editSubNote(activeSubNoteIndex); }
-}
-
-async function pasteItemsHere() {
-  if(!isPasteMode || !itemsClipboard.length) return;
-  if(clipboardAction === 'move') { itemsClipboard.forEach(c => removeItemFromTree(allData, c.id)); getCurrentList().unshift(...itemsClipboard); }
-  else { itemsClipboard.forEach(it => { const copy = JSON.parse(JSON.stringify(it)); copy.id = Date.now() + Math.random(); copy.title += ' (نسخة)'; getCurrentList().unshift(copy); }); }
-  saveData(); itemsClipboard = []; isPasteMode = false; renderMainGrid(); showNotif('تم اللصق ✅', 'success');
-}
-
-function toggleMainSelectionMode(active) {
-  isMainSelectionMode = active; if(!active) selectedMainIds.clear();
-  const tb = document.getElementById('selToolbar'); tb.classList.toggle('active', active);
-  document.getElementById('mainSelectBtn').textContent = active ? 'إلغاء' : 'تحديد';
-  renderMainGrid();
-}
-function toggleMainSelection(id) { selectedMainIds.has(id) ? selectedMainIds.delete(id) : selectedMainIds.add(id); renderMainGrid(); }
-function handleSelectionAction(action) {
-  const list = getCurrentList();
-  if(action === 'selectAll') { if(selectedMainIds.size === list.length) selectedMainIds.clear(); else list.forEach(i => selectedMainIds.add(i.id)); isMainSelectionMode = true; renderMainGrid(); }
-}
-async function deleteSelectedMainNotesWrapper() {
-  if(!selectedMainIds.size) return; if(!await verifyAppPass()) return;
-  const list = getCurrentList(); const locked = list.filter(n => selectedMainIds.has(n.id) && n.isLocked);
-  if(locked.length) { 
-    const p = await showPasswordModal(); 
-    if(!p) return;
-    const hashed = await hashPassword(p);
-    if(locked[0].passwordHash !== hashed && locked[0].passwordHash !== btoa(p)) { 
-      showNotif('كلمة المرور خاطئة', 'error'); return; 
-    } 
-  }
-  if(await showConfirm(`حذف ${selectedMainIds.size} عناصر؟`)) { selectedMainIds.forEach(id => removeItemFromTree(allData, id)); saveData(); toggleMainSelectionMode(false); showNotif('تم الحذف', 'success'); }
-}
-
-let dragSrcId = null, mobileDragEl = null, mobileDragClone = null, lastTargetEl = null;
-
-function addDragEvents(card, item) {
-  card.addEventListener('dragstart', e => { dragSrcId = parseFloat(card.dataset.id); card.classList.add('dragging'); e.dataTransfer.effectAllowed = 'move'; e.dataTransfer.setData('text/plain', dragSrcId); });
-  card.addEventListener('dragover', e => { e.preventDefault(); });
-  card.addEventListener('dragenter', () => card.classList.add('drag-target'));
-  card.addEventListener('dragleave', () => card.classList.remove('drag-target'));
-  card.addEventListener('drop', async e => { e.stopPropagation(); document.querySelectorAll('.note-card').forEach(c => c.classList.remove('drag-target')); const tid = parseFloat(card.dataset.id); if(dragSrcId === tid) return; if(card.dataset.type === 'folder') { const a = await showDragSheet(); if(a === 'move') moveItemsToFolder(tid); else if(a === 'swap') reorderItems(dragSrcId, tid); } else reorderItems(dragSrcId, tid); });
-  card.addEventListener('dragend', () => { card.classList.remove('dragging'); document.querySelectorAll('.note-card').forEach(c => c.classList.remove('drag-target')); });
-  
-  const handle = card.querySelector('.sort-handle');
-  if(handle) {
-    let tm = false, tsx = 0, tsy = 0;
-    handle.addEventListener('touchstart', e => { e.stopPropagation(); tm = false; tsx = e.touches[0].clientX; tsy = e.touches[0].clientY; mobileDragEl = card; dragSrcId = parseFloat(card.dataset.id); mobileDragClone = card.cloneNode(true); mobileDragClone.className = 'note-card dragging-mobile'; document.body.appendChild(mobileDragClone); updateClonePos(tsx, tsy); card.style.opacity = '.3'; }, {passive: true});
-    handle.addEventListener('touchmove', e => { if(!mobileDragClone) return; const t = e.touches[0]; updateClonePos(t.clientX, t.clientY); mobileDragClone.style.display = 'none'; let el = document.elementFromPoint(t.clientX, t.clientY); mobileDragClone.style.display = 'flex'; const tc = el?.closest('.note-card'); if(lastTargetEl && lastTargetEl !== tc) lastTargetEl.classList.remove('drag-target-hover'); if(tc && tc !== mobileDragEl) { tc.classList.add('drag-target-hover'); lastTargetEl = tc; } else lastTargetEl = null; }, {passive: true});
-    handle.addEventListener('touchend', async () => { if(!mobileDragClone) return; mobileDragClone.remove(); mobileDragClone = null; if(mobileDragEl) mobileDragEl.style.opacity = '1'; if(lastTargetEl) { lastTargetEl.classList.remove('drag-target-hover'); const tid = parseFloat(lastTargetEl.dataset.id); if(lastTargetEl.dataset.type === 'folder') { const a = await showDragSheet(); if(a === 'move') moveItemsToFolder(tid); else if(a === 'swap') reorderItems(dragSrcId, tid); } else reorderItems(dragSrcId, tid); } mobileDragEl = null; lastTargetEl = null; }, {passive: true});
-  }
-}
-
-function updateClonePos(x, y) { if(mobileDragClone) { mobileDragClone.style.left = (x - 77) + 'px'; mobileDragClone.style.top = (y - 77) + 'px'; } }
-
-function showDragSheet() { openSheet('dragSheet'); return new Promise(r => { window.resolveDragAction = action => { closeSheet('dragSheet'); r(action); }; }); }
-function moveItemsToFolder(tfid) { const list = getCurrentList(); const tf = findNoteById(allData, tfid); if(!tf || tf.type !== 'folder') return; const items = (selectedMainIds.has(dragSrcId) && selectedMainIds.size > 1) ? list.filter(n => selectedMainIds.has(n.id) && n.id !== tfid) : list.filter(n => parseFloat(n.id) === dragSrcId && n.id !== tfid); if(!items.length) return; items.forEach(it => removeItemFromTree(allData, it.id)); items.forEach(it => tf.items.unshift(it)); saveData(); if(selectedMainIds.has(dragSrcId)) toggleMainSelectionMode(false); else renderMainGrid(); }
-function reorderItems(srcId, targetId) { const list = getCurrentList(); const si = list.findIndex(n => parseFloat(n.id) === srcId); const ti = list.findIndex(n => parseFloat(n.id) === targetId); if(si < 0 || ti < 0 || si === ti) return; const [m] = list.splice(si, 1); list.splice(ti, 0, m); saveData(); renderMainGrid(); }
-
-function showCreateMenu() { const cm = document.getElementById('createMenu'); if(cm.classList.contains('open')) { cm.classList.remove('open'); setTimeout(() => cm.style.display = 'none', 200); } else { cm.style.display = 'flex'; requestAnimationFrame(() => cm.classList.add('open')); } }
-async function createItemWrapper(type) { document.getElementById('createMenu').classList.remove('open'); document.getElementById('createMenu').style.display = 'none'; const title = await showInputModal(type === 'folder' ? 'اسم المجلد:' : 'عنوان الملاحظة:', '', 'single'); if(title) { const ni = { id: Date.now(), type, title, items: [], isLocked: false }; getCurrentList().unshift(ni); saveData(); renderMainGrid(); if(type === 'note') openNoteDetails(ni.id); } }
-
-async function handleSettingsOpen() { 
-  const sp = localStorage.getItem(APP_PASS_KEY); 
-  if(sp) { 
-    const p = await showPasswordModal(); 
-    if(!p) return;
-    const hashed = await hashPassword(p);
-    if(hashed !== sp && btoa(p) !== sp) { 
-      showNotif('كلمة مرور خاطئة', 'error'); return; 
-    } 
-  } 
-  updateSettingsUI(); openSheet('settingsSheet'); 
-}
-
-function updateSettingsUI() { const has = !!localStorage.getItem(APP_PASS_KEY); document.getElementById('setPassBtn').style.display = has ? 'none' : 'flex'; document.getElementById('removePassBtn').style.display = has ? 'flex' : 'none'; }
-
-async function setAppPassword() { 
-  closeSheet('settingsSheet'); 
-  setTimeout(async () => { 
-    const p = await showPasswordModal(); 
-    if(p) { 
-      const hashed = await hashPassword(p);
-      localStorage.setItem(APP_PASS_KEY, hashed); 
-      saveData(); 
-      showNotif('تم القفل بنجاح', 'success'); 
-    } 
-  }, 350); 
-}
-
-function removeAppPassword() { closeSheet('settingsSheet'); setTimeout(async () => { if(await showConfirm('حذف كلمة مرور التطبيق؟')) { localStorage.removeItem(APP_PASS_KEY); saveData(); showNotif('تم حذف كلمة المرور', 'info'); } }, 350); }
-
-function deleteAllData() { 
-  closeSheet('settingsSheet'); 
-  setTimeout(async () => { 
-    if(!await showConfirm('حذف جميع البيانات نهائياً؟')) { return; } 
-    if(!await showConfirm('هل أنت متأكد تماماً؟ سيتم حذفها من السحابة أيضاً!')) { return; } 
-    allData = []; saveData(); renderMainGrid(); showNotif('تم حذف جميع البيانات', 'info'); 
-  }, 350); 
-}
-
-function exportDataManual() { closeSheet('settingsSheet'); setTimeout(() => showInputModal('نسخة احتياطية (كود) — انسخ الكل:', JSON.stringify(allData), 'area', true), 400); }
-function importDataPaste() { closeSheet('settingsSheet'); setTimeout(async () => { const t = await showInputModal('الصق نص النسخة:', '', 'area', false, true); if(t) { try { let c = t.trim().replace(/[\u2018\u2019]/g, "'").replace(/[\u201C\u201D]/g, '"'); allData = JSON.parse(c); saveData(); renderMainGrid(); showNotif('تم الاستيراد بنجاح', 'success'); } catch(err) { showNotif('الكود غير صالح', 'error'); } } }, 350); }
-
-function downloadJSON() {
-  closeSheet('settingsSheet');
-  const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(allData));
-  const downloadAnchorNode = document.createElement('a');
-  downloadAnchorNode.setAttribute("href", dataStr);
-  downloadAnchorNode.setAttribute("download", "smart_notes_backup.json");
-  document.body.appendChild(downloadAnchorNode);
-  downloadAnchorNode.click();
-  downloadAnchorNode.remove();
-  showNotif('تم التنزيل', 'success');
-}
-
-function importJSON() {
-  closeSheet('settingsSheet');
-  document.getElementById('jsonFileInput').click();
-}
-
-function handleJSONImport(event) {
-  const file = event.target.files[0];
-  if (!file) return;
-  const reader = new FileReader();
-  reader.onload = function(e) {
-    try {
-      let c = e.target.result.trim().replace(/[\u2018\u2019]/g, "'").replace(/[\u201C\u201D]/g, '"');
-      allData = JSON.parse(c);
-      saveData();
-      renderMainGrid();
-      showNotif('تم الاستيراد بنجاح', 'success');
-    } catch (err) {
-      showNotif('الملف غير صالح', 'error');
-    }
-  };
-  reader.readAsText(file);
-  event.target.value = '';
-}
-
-async function shareBackupText() {
-  closeSheet('settingsSheet');
-  const backupText = JSON.stringify(allData);
-  if (navigator.share) {
-    try {
-      await navigator.share({
-        title: 'نسخة احتياطية',
-        text: backupText
-      });
-    } catch (err) {
-      console.log(err);
-    }
-  } else {
-    showInputModal('نسخ احتياطي (كود) — انسخ الكل:', backupText, 'area', true);
-  }
-}
-
-function toggleGoogleAuth() {
-    if (currentUid) {
-        handleFirebaseLogout();
-    } else {
-        closeSheet('settingsSheet');
-        showNotif("جاري الاتصال بجوجل...", "info");
-        auth.signInWithPopup(provider).catch(e => {
-            showNotif("فشل الدخول", "error");
+function saveToCloud() {
+    const user = auth.currentUser;
+    if(user) {
+        setSyncLoader(true);
+        db.collection('vaults').doc(user.uid).set({
+            accounts: accounts,
+            folders: folders
+        }).then(() => {
+            setSyncLoader(false);
+        }).catch(error => {
+            console.error(error);
+            setSyncLoader(false, true);
+            showToast("حدث خطأ أثناء الحفظ");
         });
     }
 }
 
-function checkGoogleLoginState() {
-    const authLabel = document.getElementById('googleAuthLabel');
-    const authIconWrap = document.getElementById('googleAuthIconWrap');
+function exportDataAuto() {
+    closeSideMenu();
+    const dataToSave = { accounts: accounts, folders: folders };
+    const blob = new Blob([JSON.stringify(dataToSave)], {type: "application/json"});
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = "secrets_vault_backup.json";
+    a.click();
+}
 
-    if(currentUid) {
-        authLabel.textContent = 'تسجيل الخروج من جوجل';
-        const photoUrl = auth.currentUser ? auth.currentUser.photoURL : null;
-        if(photoUrl) {
-            authIconWrap.innerHTML = `<img src="${photoUrl}" style="width: 100%; height: 100%; object-fit: cover; border-radius: 50%;" alt="User">`;
-        } else {
-            authIconWrap.innerHTML = `<svg viewBox="0 0 24 24"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>`;
+function importDataWrapper(e) {
+    closeSideMenu();
+    const reader = new FileReader();
+    reader.onload = (f) => {
+        try {
+            const imported = JSON.parse(f.target.result);
+            const rawAccounts = Array.isArray(imported) ? imported : (imported.accounts || []);
+            const newFolders = imported.folders || ["عام"];
+
+            const seenCombinations = new Set(accounts.map(a => {
+                const em = (a.email || "").trim().toLowerCase();
+                const fol = a.folder || "عام";
+                return `${em}|${fol}`;
+            }));
+            
+            const cleanAccounts = [];
+
+            rawAccounts.forEach(importedAcc => {
+                const rawEmail = importedAcc.email || importedAcc.title || "مستورد";
+                const emailLower = rawEmail.trim().toLowerCase();
+                const folder = importedAcc.folder || "عام";
+                const combo = `${emailLower}|${folder}`;
+
+                if (!seenCombinations.has(combo)) {
+                    seenCombinations.add(combo);
+                    cleanAccounts.push({
+                        id: importedAcc.id || Date.now() + Math.random(),
+                        email: rawEmail,
+                        pass: importedAcc.pass || "...",
+                        folder: folder
+                    });
+                }
+            });
+
+            accounts = [...accounts, ...cleanAccounts];
+
+            newFolders.forEach(f => {
+                if(!folders.includes(f)) folders.push(f);
+            });
+
+            cleanAccounts.forEach(acc => {
+                if (acc.folder && !folders.includes(acc.folder)) {
+                    folders.push(acc.folder);
+                }
+            });
+
+            saveToCloud();
+            renderFoldersBar();
+            applySort(currentSort);
+
+            if (cleanAccounts.length === 0 && rawAccounts.length > 0) {
+                showToast("الحسابات موجودة مسبقاً");
+            } else {
+                showToast("تم استعادة البيانات بنجاح");
+            }
+        } catch(err){
+            showToast("ملف غير صالح");
         }
-    } else {
-        authLabel.textContent = 'تسجيل الدخول باستخدام جوجل';
-        authIconWrap.innerHTML = `
-            <svg viewBox="0 0 24 24" style="width: 20px; height: 20px; margin: auto; stroke: none;">
-                <path d="M22 12c0-.85-.08-1.68-.22-2.48H12v4.69h5.68c-.24 1.5-1.12 2.78-2.39 3.64v3.02h3.86c2.26-2.09 3.56-5.17 3.56-8.87z" fill="#4285F4"/>
-                <path d="M12 22c2.81 0 5.17-.93 6.9-2.52l-3.86-3.02c-.93.63-2.12 1-3.04 1-2.34 0-4.32-1.58-5.02-3.71H3.02v3.12C4.75 20.32 8.08 22 12 22z" fill="#34A853"/>
-                <path d="M6.98 13.75c-.18-.53-.28-1.1-.28-1.75s.1-1.22.28-1.75V7.13H3.02C2.37 8.43 2 9.94 2 12s.37 3.57 1.02 4.87l3.96-3.12z" fill="#FBBC05"/>
-                <path d="M12 5.38c1.53 0 2.91.53 3.98 1.51l2.98-2.98C17.17 2.15 14.81 1 12 1 8.08 1 4.75 2.68 3.02 6.13l3.96 3.12c.7-2.13 2.68-3.87 5.02-3.87z" fill="#EA4335"/>
-            </svg>`;
+    };
+    if(e.target.files.length > 0) {
+        reader.readAsText(e.target.files[0]);
     }
 }
 
-function handleFirebaseLogout() {
-    closeSheet('settingsSheet');
-    setTimeout(async () => {
-        if(await showConfirm("هل تريد تسجيل الخروج من السحابة؟")) {
-            auth.signOut().then(() => {
-                localStorage.removeItem(LOCAL_DATA_KEY);
-                localStorage.removeItem(APP_PASS_KEY);
-                allData = [];
-                window.location.reload();
-            });
-        }
-    }, 350);
-}
-
-function setSyncLoader(show) { document.getElementById('syncLoader').style.display = show ? 'inline-block' : 'none'; }
-
-let notifTimer = null;
-function showNotif(msg, type = 'info') { const t = document.getElementById('notifToast'); const icon = document.getElementById('notifIcon'); document.getElementById('notifMsg').textContent = msg; const colors = {success: '#10b981', error: '#ef4444', info: '#6366f1'}; t.style.background = colors[type] || colors.info; if(type === 'success') icon.innerHTML = '<polyline points="20 6 9 17 4 12"/>'; else if(type === 'error') icon.innerHTML = '<line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>'; else icon.innerHTML = '<circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/>'; t.classList.add('show'); if(notifTimer) clearTimeout(notifTimer); notifTimer = setTimeout(() => t.classList.remove('show'), 2500); }
-
-function toggleTheme() {
-    const isDark = document.body.classList.toggle('dark-mode');
-    localStorage.setItem('smartNotes_theme', isDark ? 'dark' : 'light');
-    updateThemeIcon(isDark);
-}
-
-function updateThemeIcon(isDark) {
-    const icon = document.getElementById('themeIcon');
-    const metaThemeColor = document.getElementById('metaThemeColor');
-    if(isDark) {
-        icon.innerHTML = '<path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"></path>';
-        if(metaThemeColor) metaThemeColor.content = '#0f172a';
+function handleAppLockSettings() {
+    closeSideMenu();
+    const appPass = localStorage.getItem('appPass');
+    if(appPass) {
+        openPasswordModal("أدخل الرمز لإزالته", (v) => {
+            if(v === appPass) { 
+                localStorage.removeItem('appPass'); 
+                showToast("تم إزالة القفل");
+            }
+            else showToast("خطأ في الرمز");
+        });
     } else {
-        icon.innerHTML = '<circle cx="12" cy="12" r="5"></circle><line x1="12" y1="1" x2="12" y2="3"></line><line x1="12" y1="21" x2="12" y2="23"></line><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line><line x1="1" y1="12" x2="3" y2="12"></line><line x1="21" y1="12" x2="23" y2="12"></line><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"></line>';
-        if(metaThemeColor) metaThemeColor.content = '#ffffff';
+        openPasswordModal("تعيين رمز جديد", (v) => { 
+            if(v) { 
+                localStorage.setItem('appPass', v); 
+                showToast("تم القفل");
+            } 
+        });
+    }
+}
+
+function confirmDeleteAll() {
+    closeSideMenu();
+    customConfirm("حذف كل البيانات نهائياً؟", () => {
+        accounts = []; folders = ["عام"];
+        saveToCloud();
+        showToast("تم تفريغ الخزنة");
+    });
+}
+
+function pushHistory(type = 'modal') { 
+    window.history.pushState({modal: type}, null, ''); 
+}
+
+function goBack() { 
+    if(window.history.state) {
+        window.history.back();
+        return;
+    }
+    const overlays = document.querySelectorAll('.overlay');
+    let visible = false;
+    overlays.forEach(o => { 
+        if(o.classList.contains('show')) { 
+            o.classList.remove('show'); 
+            setTimeout(()=>o.style.display='none',200); 
+            visible=true; 
+        } 
+    });
+    
+    if(!visible && document.getElementById('vaultPage').style.display === 'flex') {
+        document.getElementById('vaultPage').style.display = 'none';
+    }
+}
+
+window.onpopstate = () => {
+    const overlays = document.querySelectorAll('.overlay');
+    let closedModal = false;
+    overlays.forEach(o => {
+        if(o.classList.contains('show')) {
+            o.classList.remove('show');
+            setTimeout(()=>o.style.display='none', 200);
+            closedModal = true;
+        }
+    });
+    if(!closedModal) {
+        const vault = document.getElementById('vaultPage');
+        if(vault && vault.style.display === 'flex') {
+            vault.style.display = 'none';
+        } else {
+            closeSideMenu();
+        }
+    }
+};
+
+function showOverlay(id) {
+    pushHistory();
+    const el = document.getElementById(id);
+    el.style.display = 'flex';
+    el.offsetHeight; 
+    el.classList.add('show');
+}
+
+function submitPassword() {
+    const val = document.getElementById('globalPassInput').value;
+    const cb = pendingCallback;
+    goBack(); 
+    if(cb) { setTimeout(() => { cb(val); }, 200); }
+    pendingCallback = null;
+}
+
+// الإضافة مسموحة دائماً بدون قفل
+function prepareSaveAccount() {
+    if (!auth.currentUser) {
+        showToast("اتصل بحساب جوجل من القائمة أولاً");
+        return;
+    }
+
+    const email = document.getElementById('emailInput').value.trim();
+    if (!email) {
+        showToast("أدخل البيانات أولاً");
+        return;
+    }
+    isMoveAction = false;
+    openFolderSelectModal("حفظ في");
+}
+
+function saveAccount(targetFolder) {
+    const email = document.getElementById('emailInput').value.trim();
+    const pass = document.getElementById('passInput').value;
+    
+    const lowerEmail = email.toLowerCase();
+    const isDuplicate = accounts.some(acc => 
+        (acc.email || "").trim().toLowerCase() === lowerEmail && acc.folder === targetFolder
+    );
+
+    if (isDuplicate) {
+        showToast("هذا الحساب موجود مسبقاً في هذا القسم");
+        return;
+    }
+
+    accounts.unshift({ id: Date.now(), email, pass, folder: targetFolder });
+    saveToCloud();
+    document.getElementById('emailInput').value = '';
+    document.getElementById('passInput').value = '';
+    applySort(currentSort); 
+    showToast("تم الحفظ بنجاح");
+}
+
+function renderFoldersBar() {
+    const bar = document.getElementById('foldersBar');
+    bar.innerHTML = '';
+    let totalCount = accounts.length;
+    
+    const allChip = document.createElement('div');
+    allChip.className = `chip ${activeFolder === 'All' ? 'active' : ''}`;
+    allChip.innerText = `الكل (${totalCount})`;
+    allChip.onclick = () => { activeFolder = 'All'; renderVault(); renderFoldersBar(); };
+    bar.appendChild(allChip);
+    
+    folders.forEach(f => {
+        let folderCount = accounts.filter(a => a.folder === f).length;
+        const chip = document.createElement('div');
+        chip.className = `chip ${activeFolder === f ? 'active' : ''}`;
+        chip.innerText = `${f} (${folderCount})`;
+        chip.onclick = () => { activeFolder = f; renderVault(); renderFoldersBar(); };
+        chip.onmousedown = () => startFolderPress(f);
+        chip.ontouchstart = () => startFolderPress(f);
+        chip.ontouchmove = cancelPress;
+        chip.onmouseup = cancelPress;
+        chip.ontouchend = cancelPress;
+        bar.appendChild(chip);
+    });
+    
+    const addBtn = document.createElement('div');
+    addBtn.className = 'chip add-folder';
+    addBtn.innerText = '+ مجلد جديد';
+    addBtn.onclick = () => openAddFolderModal();
+    bar.appendChild(addBtn);
+}
+
+function renderVault() {
+    const list = document.getElementById('vaultList');
+    const searchVal = document.getElementById('searchInput').value ? document.getElementById('searchInput').value.toLowerCase() : '';
+    list.innerHTML = '';
+    let displayAccounts = accounts;
+    if (activeFolder !== 'All') displayAccounts = displayAccounts.filter(acc => acc.folder === activeFolder);
+    if(searchVal) displayAccounts = displayAccounts.filter(acc => (acc.email && acc.email.toLowerCase().includes(searchVal)) || (acc.pass && acc.pass.toLowerCase().includes(searchVal)));
+    
+    if(displayAccounts.length === 0) { 
+        list.innerHTML = '<div style="text-align:center; padding:60px 20px; color:var(--text-3);"><svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1" style="opacity:0.3; margin-bottom:10px;"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg><h3>لا توجد حسابات</h3></div>'; 
+        return; 
+    }
+    
+    displayAccounts.forEach(acc => {
+        const card = document.createElement('div');
+        card.className = `account-card ${selectedIds.has(acc.id) ? 'selected-card' : ''}`;
+        card.setAttribute('data-id', acc.id);
+        const displayName = acc.email || "بدون عنوان";
+        
+        let leftSide = '';
+        if (isSelectionMode) {
+            leftSide = `<div class="selection-check"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="4"><polyline points="20 6 9 17 4 12"></polyline></svg></div>`;
+        } else if (!searchVal && activeFolder !== 'All') {
+            leftSide = `<div class="drag-handle-visible" onmousedown="initDrag(event)" ontouchstart="initDrag(event)"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="9" cy="12" r="1"/><circle cx="9" cy="5" r="1"/><circle cx="9" cy="19" r="1"/><circle cx="15" cy="12" r="1"/><circle cx="15" cy="5" r="1"/><circle cx="15" cy="19" r="1"/></svg></div>`;
+        } else {
+             leftSide = `<div class="card-favicon">${displayName[0].toUpperCase()}</div>`;
+        }
+        
+        card.innerHTML = `
+            ${leftSide}
+            <div class="card-main" onclick="handleCardClick(event, ${acc.id})">
+                <div class="card-email" 
+                     onmousedown="startPress('email', ${acc.id})" ontouchstart="startPress('email', ${acc.id})" 
+                     ontouchmove="cancelPress()"
+                     onmouseup="cancelPress()" ontouchend="cancelPress()">
+                    <span>${displayName}</span>
+                </div>
+                <div id="pass-${acc.id}" class="card-pass-pill hidden-pass"
+                    onmousedown="startPress('pass', ${acc.id})" ontouchstart="startPress('pass', ${acc.id})" 
+                    ontouchmove="cancelPress()"
+                    onmouseup="cancelPress()" ontouchend="cancelPress()">••••••••</div>
+            </div>
+        `;
+        list.appendChild(card);
+    });
+}
+
+function toggleSelectionMode() {
+    isSelectionMode = !isSelectionMode;
+    selectedIds.clear();
+    const btn = document.getElementById('selectToggleBtn');
+    const bottomBar = document.getElementById('bottomBar');
+    if (isSelectionMode) {
+        btn.classList.add('active');
+        bottomBar.style.display = 'flex';
+        document.getElementById('selectedCount').innerText = "محدد صفر";
+    } else {
+        btn.classList.remove('active');
+        bottomBar.style.display = 'none';
+    }
+    renderVault();
+}
+
+// قفل وتحديث مباشر للحذف المتعدد
+function deleteSelected() {
+    if(selectedIds.size === 0) return;
+    const appPass = localStorage.getItem('appPass');
+    
+    const doDelete = () => {
+        customConfirm(`هل أنت متأكد من الحذف؟`, () => {
+            accounts = accounts.filter(acc => !selectedIds.has(acc.id));
+            saveToCloud();
+            toggleSelectionMode(); 
+            renderFoldersBar(); // تحديث الأرقام بالعداد
+            showToast("تم الحذف");
+        });
+    };
+
+    if (appPass) {
+        openPasswordModal("أدخل الرمز للحذف", (v) => {
+            if (v === appPass) doDelete();
+            else showToast("رمز خاطئ");
+        });
+    } else {
+        doDelete();
+    }
+}
+
+function handleCardClick(e, id) {
+    if (isSelectionMode) {
+        if (selectedIds.has(id)) selectedIds.delete(id);
+        else selectedIds.add(id);
+        document.getElementById('selectedCount').innerText = selectedIds.size + " محدد";
+        renderVault();
+    } else {
+        if(e.target.closest('.drag-handle-visible')) return;
+        handlePassClick(id);
+    }
+}
+
+function handlePassClick(id) {
+    if(isLongPress) return;
+    const el = document.getElementById(`pass-${id}`);
+    const acc = accounts.find(a => a.id === id);
+    if(el.classList.contains('hidden-pass')) {
+         el.innerText = acc.pass || '...'; 
+         el.classList.remove('hidden-pass');
+         el.style.fontSize = "16px"; el.style.letterSpacing = "0";
+    } else { 
+        el.innerText = '••••••••'; 
+        el.classList.add('hidden-pass'); 
+        el.style.fontSize = "22px"; el.style.letterSpacing = "4px";
+    }
+}
+
+function openFolderSelectModal(title) {
+    showOverlay('folderSelectModal');
+    document.getElementById('folderModalTitle').innerText = title;
+    const listBody = document.getElementById('folderListModalBody');
+    listBody.innerHTML = '';
+    const addRow = document.createElement('div');
+    addRow.className = 'move-folder-option';
+    addRow.style.color = 'var(--primary)';
+    addRow.innerHTML = '+ مجلد جديد';
+    addRow.onclick = () => { goBack(); setTimeout(openAddFolderModal, 200); };
+    listBody.appendChild(addRow);
+    folders.forEach(f => {
+        const row = document.createElement('div');
+        row.className = 'move-folder-option';
+        row.innerText = f;
+        row.onclick = () => {
+            goBack();
+            if (isMoveAction) executeMove(f);
+            else saveAccount(f);
+        };
+        listBody.appendChild(row);
+    });
+}
+
+function openMoveModal() {
+    if(selectedIds.size === 0) return;
+    isMoveAction = true;
+    openFolderSelectModal("نقل عناصر");
+}
+
+function executeMove(targetFolder) {
+    accounts.forEach(acc => { if(selectedIds.has(acc.id)) acc.folder = targetFolder; });
+    saveToCloud();
+    toggleSelectionMode(); activeFolder = targetFolder;
+    showToast("تم النقل");
+}
+
+function openAddFolderModal(renameTarget = null) {
+    folderRenameTarget = renameTarget;
+    document.getElementById('addFolderTitle').innerText = renameTarget ? "تعديل المجلد" : "مجلد جديد";
+    const input = document.getElementById('folderNameInput');
+    input.value = renameTarget || '';
+    showOverlay('addFolderModal');
+    input.focus();
+}
+
+function submitFolder() {
+    const name = document.getElementById('folderNameInput').value.trim();
+    if(!name) return;
+    if (folderRenameTarget) {
+        const index = folders.indexOf(folderRenameTarget);
+        if(index !== -1) folders[index] = name;
+        accounts.forEach(acc => { if(acc.folder === folderRenameTarget) acc.folder = name; });
+    } else {
+        if(!folders.includes(name)) folders.push(name);
+    }
+    saveToCloud(); goBack();
+}
+
+function startFolderPress(f) {
+    isLongPress = false;
+    longPressTimer = setTimeout(() => { isLongPress = true; if(f!=='عام') openAddFolderModal(f); }, 600);
+}
+
+let draggingItem = null;
+function initDrag(e) {
+    if(isSelectionMode) return;
+    const handle = e.target.closest('.drag-handle-visible');
+    if(!handle) return;
+    draggingItem = handle.closest('.account-card');
+    const list = document.getElementById('vaultList');
+    list.addEventListener('mousemove', onDragMove);
+    list.addEventListener('touchmove', onDragMove, {passive: false});
+    document.addEventListener('mouseup', onDragEnd);
+    document.addEventListener('touchend', onDragEnd);
+    draggingItem.classList.add('dragging');
+    if(navigator.vibrate) navigator.vibrate(20);
+}
+function onDragMove(e) {
+    if(!draggingItem) return;
+    e.preventDefault();
+    const list = document.getElementById('vaultList');
+    let clientY = e.type === 'touchmove' ? e.touches[0].clientY : e.clientY;
+    const siblings = [...list.querySelectorAll('.account-card:not(.dragging)')];
+    let nextSibling = siblings.find(sibling => clientY <= sibling.getBoundingClientRect().top + sibling.offsetHeight / 2);
+    list.insertBefore(draggingItem, nextSibling);
+}
+function onDragEnd() {
+    if(!draggingItem) return;
+    draggingItem.classList.remove('dragging');
+    draggingItem = null;
+    document.removeEventListener('mouseup', onDragEnd);
+    document.removeEventListener('touchend', onDragEnd);
+    saveNewOrder();
+}
+function saveNewOrder() {
+    const list = document.getElementById('vaultList');
+    const cards = list.querySelectorAll('.account-card');
+    const reorderedIds = [];
+    cards.forEach(c => reorderedIds.push(Number(c.getAttribute('data-id'))));
+    if(activeFolder !== 'All') {
+        const folderItems = accounts.filter(a => a.folder === activeFolder);
+        const sortedFolderItems = [];
+        reorderedIds.forEach(id => {
+            const item = folderItems.find(a => a.id === id);
+            if(item) sortedFolderItems.push(item);
+        });
+        const otherItems = accounts.filter(a => a.folder !== activeFolder);
+        accounts = [...sortedFolderItems, ...otherItems]; 
+    } else {
+         const newAccounts = [];
+         reorderedIds.forEach(id => {
+             const acc = accounts.find(a => a.id === id);
+             if(acc) newAccounts.push(acc);
+         });
+         accounts = newAccounts;
+    }
+    saveToCloud();
+}
+
+function startPress(type, id) {
+    isLongPress = false;
+    longPressTimer = setTimeout(() => { isLongPress = true; openContextMenu(type, id); }, 800);
+}
+function cancelPress() { clearTimeout(longPressTimer); }
+
+function openContextMenu(type, id) {
+    currentCtxId = id; currentCtxType = type;
+    showOverlay('contextModal');
+    if (navigator.vibrate) navigator.vibrate(50);
+}
+
+// قفل وتحديث مباشر لخيارات التعديل والحذف
+function ctxAction(action) {
+    goBack();
+    const acc = accounts.find(a => a.id === currentCtxId);
+    const appPass = localStorage.getItem('appPass');
+    
+    setTimeout(() => {
+        if (!acc) return;
+        
+        if (action === 'copy') {
+            copyToClipboard(currentCtxType === 'email' ? acc.email : acc.pass);
+        } 
+        else if (action === 'delete') {
+            const doDelete = () => {
+                customConfirm("حذف نهائي؟", () => {
+                    accounts = accounts.filter(a => a.id !== currentCtxId);
+                    saveToCloud();
+                    renderVault(); // تحديث فوري
+                    renderFoldersBar(); // تحديث الأرقام
+                    showToast("تم الحذف");
+                });
+            };
+
+            if (appPass) {
+                openPasswordModal("أدخل الرمز للحذف", (v) => {
+                    if (v === appPass) doDelete();
+                    else showToast("رمز خاطئ");
+                });
+            } else {
+                doDelete();
+            }
+        } 
+        else if (action === 'edit') {
+            const doEdit = () => {
+                document.getElementById('emailInput').value = acc.email;
+                document.getElementById('passInput').value = acc.pass;
+                accounts = accounts.filter(a => a.id !== currentCtxId);
+                saveToCloud(); 
+                renderVault(); // تحديث فوري
+                renderFoldersBar();
+                if(document.getElementById('vaultPage').style.display === 'flex') goBack();
+            };
+
+            if (appPass) {
+                openPasswordModal("أدخل الرمز للتعديل", (v) => {
+                    if (v === appPass) doEdit();
+                    else showToast("رمز خاطئ");
+                });
+            } else {
+                doEdit();
+            }
+        }
+    }, 200);
+}
+
+function openPasswordModal(t, cb) {
+    document.getElementById('passModalTitle').innerText = t;
+    document.getElementById('globalPassInput').value = '';
+    showOverlay('passwordModal');
+    pendingCallback = cb;
+    setTimeout(()=>document.getElementById('globalPassInput').focus(), 100);
+}
+
+function customConfirm(m, cb) {
+    document.getElementById('confirmMessage').innerText = m;
+    const btn = document.getElementById('confirmYesBtn');
+    const newBtn = btn.cloneNode(true);
+    btn.parentNode.replaceChild(newBtn, btn);
+    newBtn.onclick = () => { goBack(); setTimeout(cb, 100); };
+    showOverlay('confirmModal');
+}
+
+function startVaultPress() {
+    isLongPress = false;
+    vaultPressTimer = setTimeout(() => { isLongPress = true; handleVaultLongPress(); }, 800);
+}
+function cancelVaultPress() { clearTimeout(vaultPressTimer); }
+
+function handleVaultLongPress() {
+    const vp = localStorage.getItem('vaultPass');
+    if(vp) openPasswordModal("إزالة قفل الخزنة", v => { 
+        if(v===vp){ 
+            localStorage.removeItem('vaultPass'); 
+            showToast("تم الإلغاء"); 
+        } else showToast("خطأ"); 
+    });
+    else openPasswordModal("قفل الخزنة", v => { 
+        if(v){ 
+            localStorage.setItem('vaultPass', v); 
+            showToast("تم القفل");
+        } 
+    });
+}
+
+function openVaultCheck() {
+    if(isLongPress) return;
+    
+    if (!auth.currentUser) {
+        showToast("اتصل بحساب جوجل من القائمة أولاً");
+        return;
+    }
+
+    const vp = localStorage.getItem('vaultPass');
+    if(vp) openPasswordModal("رمز الخزنة", v => { if(v===vp) openVault(); else showToast("خطأ"); });
+    else openVault();
+}
+
+function openVault() {
+    pushHistory('vault');
+    document.getElementById('vaultPage').style.display = 'flex';
+    renderFoldersBar(); renderVault();
+}
+
+function pasteFromClipboard() {
+    if (navigator.clipboard && navigator.clipboard.readText) {
+        navigator.clipboard.readText().then(t => {
+            document.getElementById('importText').value = t;
+        }).catch(err => {
+            showToast("نظام الحماية منع الزر، استخدم الضغطة المطولة للصق");
+        });
+    } else {
+        showToast("استخدم الضغطة المطولة للصق بهذا الجهاز");
+    }
+}
+
+function copyToClipboard(t) { navigator.clipboard.writeText(t).then(()=>showToast("تم النسخ")); }
+function showToast(m) { const t=document.getElementById('toast'); t.innerText=m; t.style.opacity='1'; setTimeout(()=>t.style.opacity='0',2000); }
+
+function handleAndroidBack() {
+    const openOverlay = document.querySelector('.overlay.show');
+    if (openOverlay) {
+        goBack(); 
+        sendToKodular("STAY");
+        return;
+    }
+    if (document.getElementById('vaultPage').style.display === 'flex') {
+        document.getElementById('vaultPage').style.display = 'none';
+        if(window.history.state) window.history.back();
+        sendToKodular("STAY");
+        return;
+    }
+    const sideMenu = document.getElementById('sideMenu');
+    if (sideMenu && sideMenu.classList.contains('open')) {
+        closeSideMenu();
+        sendToKodular("STAY");
+        return;
+    }
+    sendToKodular("EXIT");
+}
+
+function sendToKodular(message) {
+    if (window.AppInventor && window.AppInventor.setWebViewString) {
+        window.AppInventor.setWebViewString(message);
+    }
+}
+
+// دالة الوضع الليلي بتصليح جذري
+function toggleTheme() {
+    const body = document.body;
+    document.documentElement.removeAttribute('data-theme'); // مسح القيمة اللي كانت معلقة بالـ HTML
+    
+    body.classList.toggle('dark-theme');
+    const isDark = body.classList.contains('dark-theme');
+    
+    const themeIcon = document.getElementById('themeIcon');
+    if (themeIcon) themeIcon.innerText = isDark ? "☀️" : "🌙";
+    
+    localStorage.setItem('theme', isDark ? 'dark' : 'light');
+}
+
+// قراءة الوضع الليلي المحفوظ أول ما يفتح التطبيق
+document.addEventListener('DOMContentLoaded', () => {
+    document.documentElement.removeAttribute('data-theme'); // تنظيف إجباري
+    const savedTheme = localStorage.getItem('theme');
+    const themeIcon = document.getElementById('themeIcon');
+    
+    if (savedTheme === 'light') {
+        document.body.classList.remove('dark-theme');
+        if(themeIcon) themeIcon.innerText = "🌙";
+    } else {
+        // الافتراضي داكن إذا مافي شي محفوظ أو إذا محفوظ داكن
+        document.body.classList.add('dark-theme');
+        if(themeIcon) themeIcon.innerText = "☀️";
+    }
+
+    const vaultList = document.getElementById('vaultList');
+    if (vaultList) {
+        vaultList.addEventListener('scroll', cancelPress);
+    }
+});
+
+function clearSearch() {
+    document.getElementById('searchInput').value = '';
+    document.getElementById('clearSearchBtn').style.display = 'none';
+    renderVault();
+}
+
+document.getElementById('searchInput')?.addEventListener('input', function() {
+    document.getElementById('clearSearchBtn').style.display = this.value ? 'block' : 'none';
+});
+
+function openSortModal() {
+    showOverlay('sortModal');
+    document.getElementById('check-newest').style.display = currentSort === 'newest' ? 'inline' : 'none';
+    document.getElementById('check-oldest').style.display = currentSort === 'oldest' ? 'inline' : 'none';
+    document.getElementById('check-az').style.display = currentSort === 'az' ? 'inline' : 'none';
+}
+
+function applySort(type, render = true) {
+    currentSort = type;
+    if(type === 'newest') accounts.sort((a,b) => b.id - a.id);
+    if(type === 'oldest') accounts.sort((a,b) => a.id - b.id);
+    if(type === 'az') accounts.sort((a,b) => (a.email||'').localeCompare(b.email||''));
+    if (render) {
+        renderVault();
+        goBack();
     }
 }
