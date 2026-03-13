@@ -664,17 +664,40 @@ function toggleGoogleAuth() {
 function checkGoogleLoginState() {
     const authLabel = document.getElementById('googleAuthLabel');
     const authIconWrap = document.getElementById('googleAuthIconWrap');
+    const dot = document.getElementById('authStatusDot');
+    const userDisplayName = document.getElementById('userDisplayName');
+    const userDisplaySub = document.getElementById('userDisplaySub');
+    const userAvatarImg = document.getElementById('userAvatarImg');
+    const userAvatarDefault = document.getElementById('userAvatarDefault');
 
     if(currentUid) {
-        authLabel.textContent = 'تسجيل الخروج من جوجل';
-        const photoUrl = auth.currentUser ? auth.currentUser.photoURL : null;
+        authLabel.textContent = 'تسجيل الخروج من الحساب';
+        const user = auth.currentUser;
+        const photoUrl = user ? user.photoURL : null;
+        const displayName = user ? user.displayName : null;
+        const email = user ? user.email : null;
         if(photoUrl) {
             authIconWrap.innerHTML = `<img src="${photoUrl}" style="width: 100%; height: 100%; object-fit: cover; border-radius: 50%;" alt="User">`;
         } else {
             authIconWrap.innerHTML = `<svg viewBox="0 0 24 24"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>`;
         }
+        // Update status dot to green
+        if(dot) { dot.style.background = '#22c55e'; }
+        // Update user info section
+        if(userDisplayName) userDisplayName.textContent = displayName || 'مستخدم جوجل';
+        if(userDisplaySub) userDisplaySub.textContent = email || '';
+        if(userAvatarImg && userAvatarDefault) {
+            if(photoUrl) {
+                userAvatarImg.src = photoUrl;
+                userAvatarImg.style.display = 'block';
+                userAvatarDefault.style.display = 'none';
+            } else {
+                userAvatarImg.style.display = 'none';
+                userAvatarDefault.style.display = 'block';
+            }
+        }
     } else {
-        authLabel.textContent = 'تسجيل الدخول باستخدام جوجل';
+        authLabel.textContent = 'تسجيل الدخول';
         authIconWrap.innerHTML = `
             <svg viewBox="0 0 24 24" style="width: 20px; height: 20px; margin: auto; stroke: none;">
                 <path d="M22 12c0-.85-.08-1.68-.22-2.48H12v4.69h5.68c-.24 1.5-1.12 2.78-2.39 3.64v3.02h3.86c2.26-2.09 3.56-5.17 3.56-8.87z" fill="#4285F4"/>
@@ -682,6 +705,15 @@ function checkGoogleLoginState() {
                 <path d="M6.98 13.75c-.18-.53-.28-1.1-.28-1.75s.1-1.22.28-1.75V7.13H3.02C2.37 8.43 2 9.94 2 12s.37 3.57 1.02 4.87l3.96-3.12z" fill="#FBBC05"/>
                 <path d="M12 5.38c1.53 0 2.91.53 3.98 1.51l2.98-2.98C17.17 2.15 14.81 1 12 1 8.08 1 4.75 2.68 3.02 6.13l3.96 3.12c.7-2.13 2.68-3.87 5.02-3.87z" fill="#EA4335"/>
             </svg>`;
+        // Update status dot to red
+        if(dot) { dot.style.background = '#ef4444'; }
+        // Reset user info section
+        if(userDisplayName) userDisplayName.textContent = 'مستخدم زائر';
+        if(userDisplaySub) userDisplaySub.textContent = 'سجل الدخول للمزامنة';
+        if(userAvatarImg && userAvatarDefault) {
+            userAvatarImg.style.display = 'none';
+            userAvatarDefault.style.display = 'block';
+        }
     }
 }
 
