@@ -11,6 +11,12 @@ const firebaseConfig = {
 firebase.initializeApp(firebaseConfig);
 const auth = firebase.auth();
 const db = firebase.firestore();
+
+// تفعيل ميزة الأوفلاين السحابي
+db.enablePersistence().catch(function(err) {
+    console.log("Offline error: ", err.code);
+});
+
 const provider = new firebase.auth.GoogleAuthProvider();
 
 const APP_PASS_KEY = 'smartNotes_appPass';
@@ -62,27 +68,86 @@ auth.onAuthStateChanged(user => {
     if (user) {
         currentUid = user.uid;
         checkGoogleLoginState();
-        setupRealtimeListener(user.uid);
+        syncOnceThenListen(user.uid);
     } else {
         currentUid = null;
         if(unsubscribeNotes) { unsubscribeNotes(); unsubscribeNotes = null; }
         checkGoogleLoginState();
+        
+        // جلب بيانات الزائر المحلي
+        const cachedData = localStorage.getItem(LOCAL_DATA_KEY);
+        allData = cachedData ? JSON.parse(cachedData) : [];
+        renderMainGrid();
     }
 });
 
-function loadData() {
-    const cachedData = localStorage.getItem(LOCAL_DATA_KEY);
-    if (cachedData) {
-        try { allData = JSON.parse(cachedData); renderMainGrid(); }
-        catch (e) { console.error(e); }
-    }
+function mergeLocalAndCloud(cloudData) {
+    let localData = JSON.parse(localStorage.getItem(LOCAL_DATA_KEY)) || [];
+    if (!localData.length) return cloudData || [];
+    if (!cloudData || !cloudData.length) return localData;
+
+    let merged = [...cloudData];
+    localData.forEach(localItem => {
+        // البحث عن ملاحظة أو مجلد بنفس الاسم
+        let existing = merged.find(c => c.title === localItem.title);
+        if (existing) {
+            if (existing.type === 'folder' && localItem.type === 'folder') {
+                existing.items = [...new Set([...(existing.items || []), ...(localItem.items || [])])];
+            } else if (existing.type === 'note' && localItem.type === 'note') {
+                existing.items = [...new Set([...(existing.items || []), ...(localItem.items || [])])];
+            }
+        } else {
+            merged.push(localItem);
+        }
+    });
+    
+    // مسح المحلي بعد الدمج لتنظيف الذاكرة
+    localStorage.removeItem(LOCAL_DATA_KEY);
+    return merged;
 }
 
-function saveData() { 
-    localStorage.setItem(LOCAL_DATA_KEY, JSON.stringify(allData));
-    document.getElementById('syncText').innerText = "جاري الحفظ...";
+function syncOnceThenListen(uid) {
     setSyncLoader(true);
-    saveToFirebase();
+    db.collection('smartNotes').doc(uid).get().then(doc => {
+        let cloudData = doc.exists ? (doc.data().smartNotesData || []) : [];
+        allData = mergeLocalAndCloud(cloudData);
+        saveToFirebase(true); // نرفع الدمج عالسحابة
+        setupRealtimeListener(uid);
+    }).catch(err => {
+        setupRealtimeListener(uid);
+    });
+}
+
+function setupRealtimeListener(uid) {
+    unsubscribeNotes = db.collection('smartNotes').doc(uid).onSnapshot(docSnap => {
+        if (docSnap.exists) {
+            const data = docSnap.data();
+            if(data.smartNotesData) {
+                allData = data.smartNotesData;
+            }
+            if(data.appGlobalPass) {
+                localStorage.setItem(APP_PASS_KEY, data.appGlobalPass);
+            } else {
+                localStorage.removeItem(APP_PASS_KEY);
+            }
+            renderMainGrid();
+            if(currentNoteId) renderSubNotes();
+        }
+        setSyncLoader(false);
+    }, error => {
+        setSyncLoader(false);
+        showNotif("فشل المزامنة", "error");
+    });
+}
+
+function saveData() {
+    if (currentUid) {
+        document.getElementById('syncText').innerText = "جاري الحفظ...";
+        setSyncLoader(true);
+        saveToFirebase(true);
+    } else {
+        localStorage.setItem(LOCAL_DATA_KEY, JSON.stringify(allData));
+    }
 }
 
 function saveToFirebase(silent = true) {
@@ -99,30 +164,6 @@ function saveToFirebase(silent = true) {
         setSyncLoader(false);
         document.getElementById('syncText').innerText = "";
         if(!silent) showNotif("فشل الرفع", "error");
-    });
-}
-
-function setupRealtimeListener(uid) {
-    setSyncLoader(true);
-    unsubscribeNotes = db.collection('smartNotes').doc(uid).onSnapshot(docSnap => {
-        if (docSnap.exists) {
-            const data = docSnap.data();
-            if(data.smartNotesData) {
-                allData = data.smartNotesData;
-                localStorage.setItem(LOCAL_DATA_KEY, JSON.stringify(allData));
-            }
-            if(data.appGlobalPass) {
-                localStorage.setItem(APP_PASS_KEY, data.appGlobalPass);
-            } else {
-                localStorage.removeItem(APP_PASS_KEY);
-            }
-            renderMainGrid();
-            if(currentNoteId) renderSubNotes();
-        }
-        setSyncLoader(false);
-    }, error => {
-        setSyncLoader(false);
-        showNotif("فشل المزامنة", "error");
     });
 }
 
