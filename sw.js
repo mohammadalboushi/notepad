@@ -1,4 +1,4 @@
-const CACHE_NAME = 'smartnotes-v6';
+const CACHE_NAME = 'smartnotes-v7';
 const urlsToCache = [
   './',
   './index.html',
