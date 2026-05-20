@@ -677,7 +677,9 @@ async function pasteItemsHere() {
 
 function toggleMainSelectionMode(active) {
   isMainSelectionMode = active; if(!active) selectedMainIds.clear();
-  const tb = document.getElementById('selToolbar'); tb.classList.toggle('active', active);
+  const tb = document.getElementById('selToolbar'); 
+  tb.classList.toggle('active', active);
+  tb.style.display = active ? 'flex' : 'none'; /* هذا السطر هو الحل الجذري */
   document.getElementById('mainSelectBtn').textContent = active ? 'إلغاء' : 'تحديد';
   renderMainGrid();
 }
@@ -805,20 +807,32 @@ function fixDuplicateFolders() {
   
   for (let i = 0; i < list.length; i++) {
     const item = list[i];
-    if (item.type === 'folder') {
-      const nameKey = item.title.trim().toLowerCase();
-      if (nameMap[nameKey]) {
-        const mainFolder = nameMap[nameKey];
-        if(item.items && item.items.length > 0) { mainFolder.items.unshift(...item.items); }
-        list.splice(i, 1);
-        mergedCount++;
-        i--;
-      } else {
-        nameMap[nameKey] = item;
+    // فصل المجلدات عن الملاحظات عشان ما يندمج مجلد مع ملاحظة بنفس الاسم
+    const nameKey = item.title.trim().toLowerCase() + '_' + item.type;
+    
+    if (nameMap[nameKey]) {
+      const mainItem = nameMap[nameKey];
+      
+      // نقل المحتويات للعنصر الأساسي
+      if(item.items && item.items.length > 0) { mainItem.items.unshift(...item.items); }
+      
+      // إذا كانت ملاحظة، نحذف النصوص الفرعية المكررة تماماً
+      if (mainItem.type === 'note' && mainItem.items) {
+        mainItem.items = [...new Set(mainItem.items)];
+      }
+      
+      list.splice(i, 1);
+      mergedCount++;
+      i--;
+    } else {
+      nameMap[nameKey] = item;
+      // تنظيف النصوص المكررة من العنصر الأساسي كإجراء احترازي
+      if (item.type === 'note' && item.items) {
+        item.items = [...new Set(item.items)];
       }
     }
   }
   
-  if (mergedCount > 0) { saveData(); renderMainGrid(); showNotif(`تم دمج وإصلاح ${mergedCount} مجلدات`, 'success'); } 
-  else { showNotif('المكان الحالي لا يحتوي على مجلدات مكررة', 'info'); }
+  if (mergedCount > 0) { saveData(); renderMainGrid(); showNotif(`تم تنظيف ودمج ${mergedCount} عناصر`, 'success'); } 
+  else { showNotif('المكان الحالي نظيف ولا يحتوي على تكرار', 'info'); }
 }
