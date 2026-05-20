@@ -140,6 +140,7 @@ auth.onAuthStateChanged(user => {
     currentUid = user.uid;
     document.getElementById('authScreen').style.display = 'none';
     document.getElementById('headerUserEmail').textContent = user.email;
+    if(document.getElementById('unlockEmailDisplay')) document.getElementById('unlockEmailDisplay').textContent = user.email;
     
     // إذا مافي مفتاح بالرام (يعني عمل ريفريش)، اطلب الباسوورد لفك القفل
     if (!cryptoKey) {
