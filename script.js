@@ -125,6 +125,17 @@ document.addEventListener('DOMContentLoaded', () => {
       { cm.classList.remove('open'); cm.style.display = 'none'; }
   });
 
+  // حل تعليقة السحب إذا لمست مكان غلط
+  document.body.addEventListener('touchstart', (e) => {
+      if (mobileDragClone && !e.target.closest('.sort-handle')) {
+          mobileDragClone.remove();
+          mobileDragClone = null;
+          if (mobileDragEl) mobileDragEl.style.opacity = '1';
+          mobileDragEl = null;
+          lastTargetEl = null;
+      }
+  }, {passive: true});
+
   const savedTheme = localStorage.getItem('smartNotes_theme');
   if(savedTheme === 'dark') {
       document.body.classList.add('dark-mode');
@@ -250,7 +261,12 @@ function handleLogout() {
 // --- مزامنة السحابة ---
 function setupRealtimeListener(uid) {
   setSyncLoader(true);
-  if(unsubscribeNotes) unsubscribeNotes();
+  
+  // تنظيف الـ listener القديم إجباري
+  if (unsubscribeNotes) {
+    unsubscribeNotes();
+    unsubscribeNotes = null;
+  }
   
   unsubscribeNotes = db.collection('smartNotes').doc(uid).onSnapshot(async docSnap => {
     if (docSnap.exists) {
@@ -260,20 +276,21 @@ function setupRealtimeListener(uid) {
       if(data.encryptedPayload && cryptoKey) {
         const decrypted = await decryptData(data.encryptedPayload, cryptoKey);
         if(decrypted !== null) {
-          allData = decrypted;
-          renderMainGrid();
+          allData = decrypted; 
+          renderMainGrid(); 
           if(currentNoteId) renderSubNotes();
-        } else {
-          showNotif("تنبيه: تم تغيير مفتاح التشفير من جهاز آخر!", "error");
         }
       }
     }
     setSyncLoader(false);
   }, error => {
+    // هاد الجزء ضروري عشان إذا صار خطأ بالاتصال يطفي الـ loader وما يعلق التطبيق
     setSyncLoader(false);
-    showNotif("فشل المزامنة مع السحابة", "error");
+    console.error("خطأ في المزامنة:", error);
   });
 }
+
+
 
 async function saveData() {
   if (currentUid && cryptoKey) {
@@ -588,7 +605,7 @@ async function handleMenuAction(action) {
   else if(action === 'edit') {
     if(item.isLocked && !await checkPassword(item)) return;
     const t = await showInputModal(item.type === 'folder' ? 'اسم المجلد:' : 'عنوان الملاحظة:', item.title, 'single');
-    if(t) { item.title = t; saveData(); renderMainGrid(); }
+    if(t) { const list = getCurrentList(); const exists = list.some(n => n.id !== item.id && n.title.trim().toLowerCase() === t.trim().toLowerCase() && n.type === item.type); if(exists) { showNotif('هذا الاسم مستخدم مسبقاً! يرجى اختيار اسم مختلف.', 'error'); return; } item.title = t.trim(); saveData(); renderMainGrid(); }
   }
   else if(action === 'toggleLock') {
     if(isMulti) {
@@ -698,6 +715,7 @@ function addDragEvents(card, item) {
     handle.addEventListener('touchstart', e => { e.stopPropagation(); tm = false; tsx = e.touches[0].clientX; tsy = e.touches[0].clientY; mobileDragEl = card; dragSrcId = parseFloat(card.dataset.id); mobileDragClone = card.cloneNode(true); mobileDragClone.className = 'note-card dragging-mobile'; document.body.appendChild(mobileDragClone); updateClonePos(tsx, tsy); card.style.opacity = '.3'; }, {passive: true});
     handle.addEventListener('touchmove', e => { if(!mobileDragClone) return; const t = e.touches[0]; updateClonePos(t.clientX, t.clientY); mobileDragClone.style.display = 'none'; let el = document.elementFromPoint(t.clientX, t.clientY); mobileDragClone.style.display = 'flex'; const tc = el?.closest('.note-card'); if(lastTargetEl && lastTargetEl !== tc) lastTargetEl.classList.remove('drag-target-hover'); if(tc && tc !== mobileDragEl) { tc.classList.add('drag-target-hover'); lastTargetEl = tc; } else lastTargetEl = null; }, {passive: true});
     handle.addEventListener('touchend', async () => { if(!mobileDragClone) return; mobileDragClone.remove(); mobileDragClone = null; if(mobileDragEl) mobileDragEl.style.opacity = '1'; if(lastTargetEl) { lastTargetEl.classList.remove('drag-target-hover'); const tid = parseFloat(lastTargetEl.dataset.id); if(lastTargetEl.dataset.type === 'folder') { const a = await showDragSheet(); if(a === 'move') moveItemsToFolder(tid); else if(a === 'swap') reorderItems(dragSrcId, tid); } else reorderItems(dragSrcId, tid); } mobileDragEl = null; lastTargetEl = null; }, {passive: true});
+    handle.addEventListener('touchcancel', () => { if(mobileDragClone) { mobileDragClone.remove(); mobileDragClone = null; } if(mobileDragEl) mobileDragEl.style.opacity = '1'; mobileDragEl = null; lastTargetEl = null; }, {passive: true});
   }
 }
 
@@ -706,7 +724,7 @@ function showDragSheet() { openSheet('dragSheet'); return new Promise(r => { win
 function moveItemsToFolder(tfid) { const list = getCurrentList(); const tf = findNoteById(allData, tfid); if(!tf || tf.type !== 'folder') return; const items = (selectedMainIds.has(dragSrcId) && selectedMainIds.size > 1) ? list.filter(n => selectedMainIds.has(n.id) && n.id !== tfid) : list.filter(n => parseFloat(n.id) === dragSrcId && n.id !== tfid); if(!items.length) return; items.forEach(it => removeItemFromTree(allData, it.id)); items.forEach(it => tf.items.unshift(it)); saveData(); if(selectedMainIds.has(dragSrcId)) toggleMainSelectionMode(false); else renderMainGrid(); }
 function reorderItems(srcId, targetId) { const list = getCurrentList(); const si = list.findIndex(n => parseFloat(n.id) === srcId); const ti = list.findIndex(n => parseFloat(n.id) === targetId); if(si < 0 || ti < 0 || si === ti) return; const [m] = list.splice(si, 1); list.splice(ti, 0, m); saveData(); renderMainGrid(); }
 function showCreateMenu() { const cm = document.getElementById('createMenu'); if(cm.classList.contains('open')) { cm.classList.remove('open'); setTimeout(() => cm.style.display = 'none', 200); } else { cm.style.display = 'flex'; requestAnimationFrame(() => cm.classList.add('open')); } }
-async function createItemWrapper(type) { document.getElementById('createMenu').classList.remove('open'); document.getElementById('createMenu').style.display = 'none'; const title = await showInputModal(type === 'folder' ? 'اسم المجلد:' : 'عنوان الملاحظة:', '', 'single'); if(title) { const ni = { id: Date.now(), type, title, items: [], isLocked: false }; getCurrentList().unshift(ni); saveData(); renderMainGrid(); if(type === 'note') openNoteDetails(ni.id); } }
+async function createItemWrapper(type) { document.getElementById('createMenu').classList.remove('open'); document.getElementById('createMenu').style.display = 'none'; const title = await showInputModal(type === 'folder' ? 'اسم المجلد:' : 'عنوان الملاحظة:', '', 'single'); if(title) { const list = getCurrentList(); const exists = list.some(item => item.title.trim().toLowerCase() === title.trim().toLowerCase() && item.type === type); if (exists) { showNotif('هذا الاسم مستخدم مسبقاً! يرجى اختيار اسم مختلف.', 'error'); return; } const ni = { id: Date.now(), type, title: title.trim(), items: [], isLocked: false }; list.unshift(ni); saveData(); renderMainGrid(); if(type === 'note') openNoteDetails(ni.id); } }
 
 async function handleSettingsOpen() { 
   if(cloudAppPass) { 
@@ -778,4 +796,29 @@ function updateThemeIcon(isDark) {
     const metaThemeColor = document.getElementById('metaThemeColor');
     if(isDark) { icon.innerHTML = '<path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"></path>'; if(metaThemeColor) metaThemeColor.content = '#0f172a'; } 
     else { icon.innerHTML = '<circle cx="12" cy="12" r="5"></circle><line x1="12" y1="1" x2="12" y2="3"></line><line x1="12" y1="21" x2="12" y2="23"></line><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line><line x1="1" y1="12" x2="3" y2="12"></line><line x1="21" y1="12" x2="23" y2="12"></line><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"></line>'; if(metaThemeColor) metaThemeColor.content = '#ffffff'; }
+}
+function fixDuplicateFolders() {
+  closeSheet('settingsSheet');
+  const list = getCurrentList();
+  let mergedCount = 0;
+  const nameMap = {};
+  
+  for (let i = 0; i < list.length; i++) {
+    const item = list[i];
+    if (item.type === 'folder') {
+      const nameKey = item.title.trim().toLowerCase();
+      if (nameMap[nameKey]) {
+        const mainFolder = nameMap[nameKey];
+        if(item.items && item.items.length > 0) { mainFolder.items.unshift(...item.items); }
+        list.splice(i, 1);
+        mergedCount++;
+        i--;
+      } else {
+        nameMap[nameKey] = item;
+      }
+    }
+  }
+  
+  if (mergedCount > 0) { saveData(); renderMainGrid(); showNotif(`تم دمج وإصلاح ${mergedCount} مجلدات`, 'success'); } 
+  else { showNotif('المكان الحالي لا يحتوي على مجلدات مكررة', 'info'); }
 }
