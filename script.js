@@ -836,3 +836,31 @@ function fixDuplicateFolders() {
   if (mergedCount > 0) { saveData(); renderMainGrid(); showNotif(`تم تنظيف ودمج ${mergedCount} عناصر`, 'success'); } 
   else { showNotif('المكان الحالي نظيف ولا يحتوي على تكرار', 'info'); }
 }
+
+// --- PWA Installation Logic ---
+let deferredPrompt;
+window.addEventListener('beforeinstallprompt', (e) => {
+  e.preventDefault();
+  deferredPrompt = e;
+  const installBtn = document.getElementById('installAppBtn');
+  if (installBtn) installBtn.style.display = 'flex';
+});
+
+async function installPWA() {
+  if (!deferredPrompt) return;
+  deferredPrompt.prompt();
+  const { outcome } = await deferredPrompt.userChoice;
+  if (outcome === 'accepted') {
+    console.log('App Installed');
+  }
+  deferredPrompt = null;
+  const installBtn = document.getElementById('installAppBtn');
+  if (installBtn) installBtn.style.display = 'none';
+  closeSheet('settingsSheet');
+}
+
+window.addEventListener('appinstalled', () => {
+  deferredPrompt = null;
+  const installBtn = document.getElementById('installAppBtn');
+  if (installBtn) installBtn.style.display = 'none';
+});
